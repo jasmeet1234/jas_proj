@@ -1,9 +1,12 @@
 import os
 import time
 import math
+import json
+import urllib.request
+import importlib.util
 import pandas as pd
 import streamlit as st
-import clickhouse_connect
+import duckdb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px  # ADDED: Required for instance utilization heatmap
@@ -41,61 +44,314 @@ st.markdown("""
 # Project Header (Task 10)
 # ============================================================
 st.markdown('<div class="project-header">🔴 RedShift Pulse Analytics</div>', unsafe_allow_html=True)
-st.markdown('<div class="project-subheader">Real-time ClickHouse metric replay and bottleneck detection for Redshift clusters. Visualize pressure points, throughput trends, and system anomalies as they happened.</div>', unsafe_allow_html=True)
+st.markdown('<div class="project-subheader">Replay Redset telemetry with DuckDB-powered metrics and Kafka-ready streaming for Redshift clusters. Visualize pressure points, throughput trends, and system anomalies as they happened.</div>', unsafe_allow_html=True)
 
 # ============================================================
-# ClickHouse Connection
+# DuckDB Connection & Dataset Discovery
 # ============================================================
-CH_HOST = os.environ.get("CH_HOST", "wkixlqz135.eu-central-1.aws.clickhouse.cloud")
-CH_PORT = int(os.environ.get("CH_PORT", "8443"))
-CH_USER = os.environ.get("CH_USER", "default")
-CH_PASSWORD = os.environ.get("CH_PASSWORD", "S1uOU_hkoUkDc")
-CH_DB = os.environ.get("CH_DB", "default")
+DATA_ROOT = os.environ.get("REDSET_ROOT", "./data/redset")
+S3_BASE_URL = os.environ.get(
+    "REDSET_S3_BASE",
+    "https://s3.amazonaws.com/redshift-downloads/redset"
+)
+AUTO_DOWNLOAD = os.environ.get("REDSET_AUTO_DOWNLOAD", "false").lower() == "true"
+DATASETS = {
+    "serverless_full": os.environ.get(
+        "SERVERLESS_FULL_PATH",
+        os.path.join(DATA_ROOT, "serverless", "full.parquet")
+    ),
+    "serverless_sample_0.01": os.environ.get(
+        "SERVERLESS_SAMPLE_0.01_PATH",
+        os.path.join(DATA_ROOT, "serverless", "sample_0.01.parquet")
+    ),
+    "serverless_sample_0.001": os.environ.get(
+        "SERVERLESS_SAMPLE_0.001_PATH",
+        os.path.join(DATA_ROOT, "serverless", "sample_0.001.parquet")
+    ),
+    "provisioned_full": os.environ.get(
+        "PROVISIONED_FULL_PATH",
+        os.path.join(DATA_ROOT, "provisioned", "full.parquet")
+    ),
+    "provisioned_sample_0.01": os.environ.get(
+        "PROVISIONED_SAMPLE_0.01_PATH",
+        os.path.join(DATA_ROOT, "provisioned", "sample_0.01.parquet")
+    ),
+    "provisioned_sample_0.001": os.environ.get(
+        "PROVISIONED_SAMPLE_0.001_PATH",
+        os.path.join(DATA_ROOT, "provisioned", "sample_0.001.parquet")
+    ),
+}
 
-if not CH_PASSWORD:
-    st.error("Missing CH_PASSWORD environment variable.")
-    st.stop()
+KAFKA_ENABLED = os.environ.get("KAFKA_ENABLE", "false").lower() == "true"
+KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "redset-events")
+KAFKA_GROUP = os.environ.get("KAFKA_GROUP", "redset-dashboard")
+KAFKA_POLL_SECONDS = float(os.environ.get("KAFKA_POLL_SECONDS", "1"))
 
 @st.cache_resource(show_spinner=False)
-def get_client():
-    return clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER,
-        password=CH_PASSWORD, database=CH_DB,
-        secure=True, verify=False
+def get_duckdb():
+    return duckdb.connect(database=":memory:", read_only=False)
+
+def dataset_exists(path: str) -> bool:
+    return path and os.path.exists(path)
+
+def download_dataset(dataset_key: str, dataset_path: str):
+    if not AUTO_DOWNLOAD:
+        return
+    if dataset_exists(dataset_path):
+        return
+    os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+    if dataset_key.startswith("serverless"):
+        s3_path = f"{S3_BASE_URL}/serverless/{dataset_key.split('serverless_')[1]}.parquet"
+    else:
+        s3_path = f"{S3_BASE_URL}/provisioned/{dataset_key.split('provisioned_')[1]}.parquet"
+    try:
+        with urllib.request.urlopen(s3_path) as response, open(dataset_path, "wb") as handle:
+            handle.write(response.read())
+    except Exception as exc:
+        st.error(f"Failed to download {s3_path}: {exc}")
+        st.stop()
+
+def discover_datasets():
+    for key, path in DATASETS.items():
+        if not dataset_exists(path):
+            download_dataset(key, path)
+    available = {name: path for name, path in DATASETS.items() if dataset_exists(path)}
+    return available
+
+def ensure_events_view(conn: duckdb.DuckDBPyConnection, dataset_key: str, dataset_path: str):
+    deployment_type = "serverless" if dataset_key.startswith("serverless") else "provisioned"
+    safe_path = dataset_path.replace("'", "''")
+    conn.execute(f"CREATE OR REPLACE VIEW events_raw AS SELECT * FROM read_parquet('{safe_path}')")
+    conn.execute(
+        """
+        CREATE OR REPLACE VIEW events AS
+        SELECT
+            CAST(instance_id AS BIGINT) AS instance_id,
+            CAST(cluster_size AS BIGINT) AS cluster_size,
+            CAST(user_id AS BIGINT) AS user_id,
+            CAST(database_id AS BIGINT) AS database_id,
+            CAST(query_id AS BIGINT) AS query_id,
+            CAST(arrival_timestamp AS TIMESTAMP) AS arrival_timestamp,
+            GREATEST(CAST(compile_duration_ms AS DOUBLE), 0) AS compile_duration_ms,
+            GREATEST(CAST(queue_duration_ms AS DOUBLE), 0) AS queue_duration_ms,
+            GREATEST(CAST(execution_duration_ms AS DOUBLE), 0) AS execution_duration_ms,
+            CAST(feature_fingerprint AS VARCHAR) AS feature_fingerprint,
+            CAST(was_aborted AS BOOLEAN) AS was_aborted,
+            CAST(was_cached AS BOOLEAN) AS was_cached,
+            CAST(cache_source_query_id AS BIGINT) AS cache_source_query_id,
+            CASE
+                WHEN TRIM(LOWER(CAST(query_type AS VARCHAR))) = '' THEN 'other'
+                ELSE TRIM(LOWER(CAST(query_type AS VARCHAR)))
+            END AS query_type,
+            GREATEST(CAST(num_permanent_tables_accessed AS BIGINT), 0) AS num_permanent_tables_accessed,
+            GREATEST(CAST(num_external_tables_accessed AS BIGINT), 0) AS num_external_tables_accessed,
+            GREATEST(CAST(num_system_tables_accessed AS BIGINT), 0) AS num_system_tables_accessed,
+            CAST(read_table_ids AS VARCHAR) AS read_table_ids,
+            CAST(write_table_ids AS VARCHAR) AS write_table_ids,
+            GREATEST(CAST(mbytes_scanned AS DOUBLE), 0) AS mbytes_scanned,
+            GREATEST(CAST(mbytes_spilled AS DOUBLE), 0) AS mbytes_spilled,
+            GREATEST(CAST(num_joins AS BIGINT), 0) AS num_joins,
+            GREATEST(CAST(num_scans AS BIGINT), 0) AS num_scans,
+            GREATEST(CAST(num_aggregations AS BIGINT), 0) AS num_aggregations,
+            ? AS deployment_type
+        FROM events_raw
+        """,
+        [deployment_type],
     )
 
-try:
-    client = get_client()
-    client.command("SELECT 1")
-except Exception as e:
-    st.error(f"Failed to connect to ClickHouse: {e}")
-    st.stop()
+def ensure_stream_table(conn: duckdb.DuckDBPyConnection):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events_stream (
+            instance_id BIGINT,
+            cluster_size BIGINT,
+            user_id BIGINT,
+            database_id BIGINT,
+            query_id BIGINT,
+            arrival_timestamp TIMESTAMP,
+            compile_duration_ms DOUBLE,
+            queue_duration_ms DOUBLE,
+            execution_duration_ms DOUBLE,
+            feature_fingerprint VARCHAR,
+            was_aborted BOOLEAN,
+            was_cached BOOLEAN,
+            cache_source_query_id BIGINT,
+            query_type VARCHAR,
+            num_permanent_tables_accessed BIGINT,
+            num_external_tables_accessed BIGINT,
+            num_system_tables_accessed BIGINT,
+            read_table_ids VARCHAR,
+            write_table_ids VARCHAR,
+            mbytes_scanned DOUBLE,
+            mbytes_spilled DOUBLE,
+            num_joins BIGINT,
+            num_scans BIGINT,
+            num_aggregations BIGINT,
+            deployment_type VARCHAR
+        )
+        """
+    )
+
+def kafka_available() -> bool:
+    return importlib.util.find_spec("kafka") is not None
+
+def poll_kafka(conn: duckdb.DuckDBPyConnection, max_messages: int = 1000):
+    if not kafka_available():
+        st.error("Kafka is enabled but kafka-python is not installed. Install `kafka-python`.")
+        return 0
+    from kafka import KafkaConsumer
+
+    consumer = KafkaConsumer(
+        KAFKA_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id=KAFKA_GROUP,
+        auto_offset_reset="latest",
+        enable_auto_commit=True,
+        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+    )
+
+    rows = []
+    start = time.time()
+    for message in consumer:
+        payload = message.value
+        rows.append(
+            (
+                payload.get("instance_id"),
+                payload.get("cluster_size"),
+                payload.get("user_id"),
+                payload.get("database_id"),
+                payload.get("query_id"),
+                payload.get("arrival_timestamp"),
+                payload.get("compile_duration_ms"),
+                payload.get("queue_duration_ms"),
+                payload.get("execution_duration_ms"),
+                payload.get("feature_fingerprint"),
+                payload.get("was_aborted"),
+                payload.get("was_cached"),
+                payload.get("cache_source_query_id"),
+                payload.get("query_type"),
+                payload.get("num_permanent_tables_accessed"),
+                payload.get("num_external_tables_accessed"),
+                payload.get("num_system_tables_accessed"),
+                payload.get("read_table_ids"),
+                payload.get("write_table_ids"),
+                payload.get("mbytes_scanned"),
+                payload.get("mbytes_spilled"),
+                payload.get("num_joins"),
+                payload.get("num_scans"),
+                payload.get("num_aggregations"),
+                payload.get("deployment_type", "serverless"),
+            )
+        )
+        if len(rows) >= max_messages or time.time() - start >= KAFKA_POLL_SECONDS:
+            break
+
+    if rows:
+        ensure_stream_table(conn)
+        conn.executemany(
+            """
+            INSERT INTO events_stream VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            rows,
+        )
+    consumer.close()
+    return len(rows)
 
 # ============================================================
 # Helpers
 # ============================================================
-def safe_query_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+def safe_query_df(sql: str, params: list | None = None) -> pd.DataFrame:
     try:
-        return client.query_df(sql, parameters=params or {})
+        return conn.execute(sql, params or []).df()
     except Exception as e:
-        st.error("❌ ClickHouse query failed.")
+        st.error("❌ DuckDB query failed.")
         st.exception(e)
         st.stop()
 
-def safe_query_rows(sql: str, params: dict | None = None):
+def safe_query_rows(sql: str, params: list | None = None):
     try:
-        return client.query(sql, parameters=params or {}).result_rows
+        return conn.execute(sql, params or []).fetchall()
     except Exception as e:
-        st.error("❌ ClickHouse query failed.")
+        st.error("❌ DuckDB query failed.")
         st.exception(e)
         st.stop()
 
-def get_min_max_bucket_for_run(rid: str):
+def get_min_max_bucket_for_run():
     rows = safe_query_rows(
-        "SELECT min(bucket_start), max(bucket_start) FROM system_metrics_5min WHERE run_id = %(run_id)s",
-        {"run_id": rid}
+        """
+        SELECT min(bucket_start), max(bucket_start)
+        FROM (
+            SELECT
+                date_trunc('minute', arrival_timestamp)
+                    - (extract(minute from arrival_timestamp) % 5) * INTERVAL '1 minute'
+                    AS bucket_start
+            FROM events
+        )
+        """
     )
     return (rows[0][0], rows[0][1]) if rows else (None, None)
+
+def build_metrics_query(dep_clause: str):
+    return f"""
+    SELECT
+        bucket_start,
+        deployment_type,
+        COUNT(*) AS running_count,
+        SUM(CASE WHEN queue_duration_ms > 0 THEN 1 ELSE 0 END) AS queued_count,
+        AVG(CASE WHEN queue_duration_ms > 0 THEN 1 ELSE 0 END) AS queue_pressure,
+        AVG(CASE WHEN mbytes_spilled > 0 THEN 1 ELSE 0 END) AS spill_pressure,
+        CASE
+            WHEN SUM(execution_duration_ms) > 0
+                THEN SUM(mbytes_scanned) / (SUM(execution_duration_ms) / 1000.0)
+            ELSE 0.0
+        END AS throughput_mb_s
+    FROM (
+        SELECT
+            date_trunc('minute', arrival_timestamp)
+                - (extract(minute from arrival_timestamp) % 5) * INTERVAL '1 minute'
+                AS bucket_start,
+            deployment_type,
+            queue_duration_ms,
+            mbytes_spilled,
+            mbytes_scanned,
+            execution_duration_ms
+        FROM events
+        WHERE arrival_timestamp >= ? AND arrival_timestamp <= ?
+    )
+    {dep_clause}
+    GROUP BY bucket_start, deployment_type
+    ORDER BY bucket_start DESC
+    LIMIT 5000
+    """
+
+def build_instance_query(dep_clause: str):
+    return f"""
+    SELECT
+        bucket_start,
+        deployment_type,
+        instance_id,
+        LEAST(
+            1.0,
+            SUM(execution_duration_ms) / (300.0 * 1000.0)
+        ) AS util
+    FROM (
+        SELECT
+            date_trunc('minute', arrival_timestamp)
+                - (extract(minute from arrival_timestamp) % 5) * INTERVAL '1 minute'
+                AS bucket_start,
+            deployment_type,
+            instance_id,
+            execution_duration_ms
+        FROM events
+        WHERE arrival_timestamp >= ? AND arrival_timestamp <= ?
+    )
+    {dep_clause}
+    GROUP BY bucket_start, deployment_type, instance_id
+    ORDER BY bucket_start ASC
+    """
 
 def robust_mad_z(x: pd.Series) -> pd.Series:
     x = pd.to_numeric(x, errors="coerce")
@@ -124,25 +380,29 @@ if "run_state" not in st.session_state:
 # Default to provisioned only (strict separation)
 if "deployment_filter" not in st.session_state:
     st.session_state.deployment_filter = ["provisioned"]
+if "data_source" not in st.session_state:
+    st.session_state.data_source = "parquet"
 
 # ============================================================
 # Data Availability Check
 # ============================================================
-try:
-    runs_df = safe_query_df("""
-        SELECT run_id, max(bucket_start) as last_bucket 
-        FROM system_metrics_5min 
-        GROUP BY run_id 
-        ORDER BY last_bucket DESC 
-        LIMIT 30
-    """)
-except Exception as e:
-    st.error("Failed to fetch runs. Check connection and table 'system_metrics_5min'.")
-    st.stop()
+conn = get_duckdb()
+available_datasets = discover_datasets()
 
-if runs_df.empty:
-    st.warning("⚠️ No runs found in system_metrics_5min yet. Start ingestion first.")
-    st.stop()
+if st.session_state.data_source == "parquet":
+    if not available_datasets:
+        st.error(
+            "No local parquet datasets found. Download Redset parquet files or set REDSET_ROOT."
+        )
+        st.stop()
+    runs_df = pd.DataFrame(
+        {
+            "run_id": list(available_datasets.keys())
+        }
+    )
+else:
+    ensure_stream_table(conn)
+    runs_df = pd.DataFrame({"run_id": ["kafka_stream"]})
 
 # ============================================================
 # Sidebar Configuration
@@ -151,6 +411,21 @@ with st.sidebar:
     st.header("⚙️ Control Deck")
     
     # Task 8: Deployment Type Buttons
+    st.subheader("Data Source")
+    data_source = st.radio(
+        "Select data source",
+        options=["parquet", "kafka"],
+        index=0 if st.session_state.data_source == "parquet" else 1,
+        horizontal=True,
+    )
+    st.session_state.data_source = data_source
+
+    if data_source == "kafka":
+        st.caption(f"Kafka: {KAFKA_BOOTSTRAP} | Topic: {KAFKA_TOPIC}")
+        if not kafka_available():
+            st.warning("Kafka enabled but kafka-python is not installed. Install `kafka-python`.")
+
+    st.markdown("---")
     st.subheader("Deployment Target")
     dcol1, dcol2 = st.columns(2)
     
@@ -195,7 +470,13 @@ with st.sidebar:
         st.session_state.run_state[run_id] = {"cursor_bucket": None, "last_tick_wall": None}
     
     state = st.session_state.run_state[run_id]
-    start_b, end_b = get_min_max_bucket_for_run(run_id)
+    if st.session_state.data_source == "parquet":
+        ensure_events_view(conn, run_id, available_datasets[run_id])
+    else:
+        ensure_stream_table(conn)
+        conn.execute("CREATE OR REPLACE VIEW events AS SELECT * FROM events_stream")
+
+    start_b, end_b = get_min_max_bucket_for_run()
     
     if not start_b:
         st.warning("No data for this run yet.")
@@ -221,7 +502,7 @@ with st.sidebar:
             state["last_tick_wall"] = None
             st.rerun()
     
-    st.caption(f"Speed: 5s | Status: {'🟢 Running' if st.session_state.started else '⏸ Stopped'}")
+    st.caption(f"Speed: 5s per 5-min bucket | Status: {'🟢 Running' if st.session_state.started else '⏸ Stopped'}")
     st.markdown("---")
     
     # Task 2: All Sliders in Sidebar - Updated with small info icon
@@ -272,48 +553,21 @@ if not state.get("cursor_bucket"):
 # ============================================================
 # Data Query (Task 7: Removed max rows slider)
 # ============================================================
+if st.session_state.data_source == "kafka":
+    poll_kafka(conn)
+
 dep_filter = st.session_state.deployment_filter
-
-schema_rows = safe_query_rows("DESCRIBE TABLE system_metrics_5min")
-cols = [r[0] for r in schema_rows]
-has_qp = "queue_pressure" in cols
-has_sp = "spill_pressure" in cols
-has_thr = "throughput_mb_s" in cols
-
-select_parts = [
-    "bucket_start", "deployment_type",
-    "max(running_count) AS running_count",
-    "max(queued_count) AS queued_count",
-    ("max(queue_pressure) AS queue_pressure" if has_qp else "0.0 AS queue_pressure"),
-    ("max(spill_pressure) AS spill_pressure" if has_sp else "0.0 AS spill_pressure"),
-    ("max(throughput_mb_s) AS throughput_mb_s" if has_thr else "0.0 AS throughput_mb_s")
-]
-
 dep_clause = ""
-params = {
-    "run_id": run_id,
-    "start_bucket": start_b,
-    "cursor_bucket": state["cursor_bucket"]
-}
+params = [start_b, state["cursor_bucket"]]
 
 if len(dep_filter) == 1:
-    dep_clause = "AND deployment_type = %(dep)s"
-    params["dep"] = dep_filter[0]
+    dep_clause = "WHERE deployment_type = ?"
+    params.append(dep_filter[0])
 elif len(dep_filter) == 0:
     st.warning("Select at least one deployment type.")
     st.stop()
 
-q = f"""
-SELECT {', '.join(select_parts)}
-FROM system_metrics_5min
-WHERE run_id = %(run_id)s 
-  AND bucket_start >= %(start_bucket)s 
-  AND bucket_start <= %(cursor_bucket)s
-{dep_clause}
-GROUP BY bucket_start, deployment_type
-ORDER BY bucket_start DESC
-LIMIT 5000
-"""
+q = build_metrics_query(dep_clause)
 
 try:
     df = safe_query_df(q, params)
@@ -581,7 +835,7 @@ if z_cols:
         st.success("✅ No anomalies detected at current sensitivity")
 
 # ============================================================
-# ADDED FROM CODE 2: Instance Utilization Heatmap + Prediction - SOFT COLORS, NO WHITE
+# Instance Utilization Heatmap + Prediction - SOFT COLORS, NO WHITE
 # ============================================================
 st.markdown("---")
 section_header("🖥️ Instance Utilization & Prediction", 
@@ -603,138 +857,120 @@ utilization_colors = {
 
 def render_instance_section(dep: str, cursor_bucket):
     """Render instance utilization heatmap and prediction chart for a deployment type."""
-    top_inst_q = """
-    SELECT
-      instance_id,
-      util_latest
-    FROM instance_top_active
-    WHERE run_id = %(run_id)s
-      AND deployment_type = %(dep)s
-    ORDER BY util_latest DESC
-    LIMIT 15
-    """
-    
-    util_q = """
-    SELECT
-      bucket_start,
-      deployment_type,
-      instance_id,
-      util,
-      util_pred,
-      util_residual
-    FROM instance_util_pred_5min
-    WHERE run_id = %(run_id)s
-      AND bucket_start <= %(cursor_bucket)s
-      AND deployment_type = %(dep)s
-      AND instance_id IN %(ids)s
-    ORDER BY bucket_start ASC
-    """
-    
-    try:
-        # Get top instances by latest utilization
-        tops = safe_query_df(top_inst_q, {"run_id": run_id, "dep": dep})
-        if tops.empty:
-            st.info(f"No instance utilization data available for {dep}.")
-            return
+    dep_clause = "WHERE deployment_type = ?" if dep else ""
+    params = [start_b, cursor_bucket]
+    if dep:
+        params.append(dep)
 
-        instance_ids = tops["instance_id"].astype(int).tolist()
-        
-        # Get historical utilization data for these instances
-        dfi = safe_query_df(util_q, {
-            "run_id": run_id,
-            "cursor_bucket": cursor_bucket,
-            "dep": dep,
-            "ids": tuple(instance_ids)
-        })
-        
+    try:
+        dfi = safe_query_df(build_instance_query(dep_clause), params)
         if dfi.empty:
             st.info(f"No utilization history for {dep} instances.")
             return
 
-        # Data type conversions
         dfi["bucket_start"] = pd.to_datetime(dfi["bucket_start"], utc=True, errors="coerce")
         dfi["instance_id"] = pd.to_numeric(dfi["instance_id"], errors="coerce").astype("Int64")
 
+        latest_bucket = dfi["bucket_start"].max()
+        tops = (
+            dfi[dfi["bucket_start"] == latest_bucket]
+            .sort_values("util", ascending=False)
+            .head(15)
+        )
+        if tops.empty:
+            st.info(f"No instance utilization data available for {dep}.")
+            return
+
+        instance_ids = tops["instance_id"].dropna().astype(int).tolist()
+        dfi = dfi[dfi["instance_id"].isin(instance_ids)]
+
         st.markdown(f"**{dep.title()} Instances**")
-        
+
         dep_colors = utilization_colors[dep]
-        
-        # Create utilization heatmap (latest 120 buckets for performance)
+
         heat = dfi.pivot_table(
-            index="bucket_start", 
-            columns="instance_id", 
-            values="util", 
-            aggfunc="max"
+            index="bucket_start",
+            columns="instance_id",
+            values="util",
+            aggfunc="max",
         ).sort_index()
-        
+
         heat_tail = heat.tail(120)
-        
-        # Use soft colors, no white
-        fig_util_heat = go.Figure(data=go.Heatmap(
-            z=heat_tail.T.values,
-            x=[str(x) for x in heat_tail.index],
-            y=list(heat_tail.columns),
-            colorscale=dep_colors["heat_scale"],
-            zmin=0, zmax=1,
-            showscale=True,
-            colorbar=dict(title="Util"),
-            hoverongaps=False
-        ))
-        
+
+        fig_util_heat = go.Figure(
+            data=go.Heatmap(
+                z=heat_tail.T.values,
+                x=[str(x) for x in heat_tail.index],
+                y=list(heat_tail.columns),
+                colorscale=dep_colors["heat_scale"],
+                zmin=0,
+                zmax=1,
+                showscale=True,
+                colorbar=dict(title="Util"),
+                hoverongaps=False,
+            )
+        )
+
         fig_util_heat.update_layout(
-            height=380, 
+            height=380,
             margin=dict(l=30, r=10, t=30, b=30),
             title=f"Utilization Heatmap - {dep.title()}",
             paper_bgcolor=dep_colors["bg"],
             xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=False)
+            yaxis=dict(showgrid=False),
         )
-        st.plotly_chart(fig_util_heat, width = "stretch")
+        st.plotly_chart(fig_util_heat, width="stretch")
 
-        # Prediction vs Actual line chart for selected instance
         selected_instance = st.selectbox(
-            f"Select {dep} instance for prediction view", 
-            instance_ids, 
-            key=f"pick_{dep}_{run_id}"
+            f"Select {dep} instance for prediction view",
+            instance_ids,
+            key=f"pick_{dep}_{run_id}",
         )
-        
+
         instance_data = dfi[dfi["instance_id"] == selected_instance].sort_values("bucket_start")
-        
+        instance_data["util_pred"] = (
+            instance_data["util"].rolling(3, min_periods=1).mean()
+        )
+
         if len(instance_data) >= 5:
             fig_pred = go.Figure()
-            
-            fig_pred.add_trace(go.Scatter(
-                x=instance_data["bucket_start"],
-                y=instance_data["util"],
-                mode='lines',
-                name='Actual',
-                line=dict(color=dep_colors["line"], width=2),
-                fill='tozeroy',
-                fillcolor=dep_colors["heat_scale"][0][1]  # Use light color from scale
-            ))
-            
-            fig_pred.add_trace(go.Scatter(
-                x=instance_data["bucket_start"],
-                y=instance_data["util_pred"],
-                mode='lines',
-                name='Predicted',
-                line=dict(color=dep_colors["heat_scale"][2][1], width=2, dash='dash')  # Darker color
-            ))
-            
+
+            fig_pred.add_trace(
+                go.Scatter(
+                    x=instance_data["bucket_start"],
+                    y=instance_data["util"],
+                    mode="lines",
+                    name="Actual",
+                    line=dict(color=dep_colors["line"], width=2),
+                    fill="tozeroy",
+                    fillcolor=dep_colors["heat_scale"][0][1],
+                )
+            )
+
+            fig_pred.add_trace(
+                go.Scatter(
+                    x=instance_data["bucket_start"],
+                    y=instance_data["util_pred"],
+                    mode="lines",
+                    name="Predicted",
+                    line=dict(color=dep_colors["heat_scale"][2][1], width=2, dash="dash"),
+                )
+            )
+
             fig_pred.update_layout(
                 height=220,
                 margin=dict(l=0, r=0, t=20, b=0),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
                 paper_bgcolor=dep_colors["bg"],
                 plot_bgcolor=dep_colors["bg"],
-                showlegend=True
+                showlegend=True,
             )
-            
+
             st.caption(f"Predicted vs Actual Utilization — Instance {selected_instance}")
-            st.plotly_chart(fig_pred, width = "stretch")
+            st.plotly_chart(fig_pred, width="stretch")
         else:
             st.caption("Insufficient data points for prediction display (minimum 5 required).")
-            
+
     except Exception as e:
         st.error(f"Error loading instance data for {dep}: {e}")
 
