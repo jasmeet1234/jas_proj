@@ -2,6 +2,7 @@ import os
 import time
 import math
 import json
+import urllib.request
 import importlib.util
 import pandas as pd
 import streamlit as st
@@ -43,12 +44,17 @@ st.markdown("""
 # Project Header (Task 10)
 # ============================================================
 st.markdown('<div class="project-header">🔴 RedShift Pulse Analytics</div>', unsafe_allow_html=True)
-st.markdown('<div class="project-subheader">Real-time ClickHouse metric replay and bottleneck detection for Redshift clusters. Visualize pressure points, throughput trends, and system anomalies as they happened.</div>', unsafe_allow_html=True)
+st.markdown('<div class="project-subheader">Replay Redset telemetry with DuckDB-powered metrics and Kafka-ready streaming for Redshift clusters. Visualize pressure points, throughput trends, and system anomalies as they happened.</div>', unsafe_allow_html=True)
 
 # ============================================================
 # DuckDB Connection & Dataset Discovery
 # ============================================================
 DATA_ROOT = os.environ.get("REDSET_ROOT", "./data/redset")
+S3_BASE_URL = os.environ.get(
+    "REDSET_S3_BASE",
+    "https://s3.amazonaws.com/redshift-downloads/redset"
+)
+AUTO_DOWNLOAD = os.environ.get("REDSET_AUTO_DOWNLOAD", "false").lower() == "true"
 DATASETS = {
     "serverless_full": os.environ.get(
         "SERVERLESS_FULL_PATH",
@@ -89,7 +95,27 @@ def get_duckdb():
 def dataset_exists(path: str) -> bool:
     return path and os.path.exists(path)
 
+def download_dataset(dataset_key: str, dataset_path: str):
+    if not AUTO_DOWNLOAD:
+        return
+    if dataset_exists(dataset_path):
+        return
+    os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+    if dataset_key.startswith("serverless"):
+        s3_path = f"{S3_BASE_URL}/serverless/{dataset_key.split('serverless_')[1]}.parquet"
+    else:
+        s3_path = f"{S3_BASE_URL}/provisioned/{dataset_key.split('provisioned_')[1]}.parquet"
+    try:
+        with urllib.request.urlopen(s3_path) as response, open(dataset_path, "wb") as handle:
+            handle.write(response.read())
+    except Exception as exc:
+        st.error(f"Failed to download {s3_path}: {exc}")
+        st.stop()
+
 def discover_datasets():
+    for key, path in DATASETS.items():
+        if not dataset_exists(path):
+            download_dataset(key, path)
     available = {name: path for name, path in DATASETS.items() if dataset_exists(path)}
     return available
 
