@@ -29,7 +29,8 @@ def download_parquet(source: str, dest: str) -> str:
 
 
 def build_clean_view(conn: duckdb.DuckDBPyConnection, parquet_path: str, deployment_type: str):
-    conn.execute("CREATE OR REPLACE VIEW events_raw AS SELECT * FROM read_parquet(?)", [parquet_path])
+    safe_path = parquet_path.replace("'", "''")
+    conn.execute(f"CREATE OR REPLACE VIEW events_raw AS SELECT * FROM read_parquet('{safe_path}')")
     conn.execute(
         """
         CREATE OR REPLACE VIEW events_clean AS

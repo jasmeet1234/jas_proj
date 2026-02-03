@@ -121,7 +121,8 @@ def discover_datasets():
 
 def ensure_events_view(conn: duckdb.DuckDBPyConnection, dataset_key: str, dataset_path: str):
     deployment_type = "serverless" if dataset_key.startswith("serverless") else "provisioned"
-    conn.execute("CREATE OR REPLACE VIEW events_raw AS SELECT * FROM read_parquet(?)", [dataset_path])
+    safe_path = dataset_path.replace("'", "''")
+    conn.execute(f"CREATE OR REPLACE VIEW events_raw AS SELECT * FROM read_parquet('{safe_path}')")
     conn.execute(
         """
         CREATE OR REPLACE VIEW events AS
